@@ -21,10 +21,15 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
+// DefaultCopyPartSize declares the default size of chunks to get copied. It is currently set dumbly to 500MB. So that the maximum object size (5TB) will work without exceeding the maximum part count (10,000).
 const DefaultCopyPartSize = 1024 * 1024 * 500
 
+// DefaultCopyConcurrency sets the number of parts to request copying at once.
 const DefaultCopyConcurrency = 64
-const DefaultCopyTimeout = 60 * time.Minute
+
+// DefaultCopyTimeout is the max time we expect the copy operation to take. For a lambda < 5 minutes is best, but for a large copy it could take hours.
+// const DefaultCopyTimeout = 260 * time.Second
+const DefaultCopyTimeout = 18 * time.Hour
 
 // object details the location of a specific object.
 type object struct {
@@ -32,14 +37,18 @@ type object struct {
 	key    string
 }
 
+// Bucket returns the string pointer value for the bucket.
 func (o object) Bucket() *string {
 	return aws.String(o.bucket)
 }
 
+// Key returns the string pointer value for the object key.
 func (o object) Key() *string {
 	return aws.String(o.key)
 }
 
+// CopySourceString returns the string pointer value for passing into various
+// copy functions.
 func (o object) CopySourceString() *string {
 	return aws.String(fmt.Sprintf("%s/%s", o.bucket, o.key))
 }
@@ -49,7 +58,8 @@ func (o object) String() string {
 	return fmt.Sprintf("s3://%s/%s", o.bucket, o.key)
 }
 
-type Input struct {
+// CopierInput holds the input paramters for Copier.Copy.
+type CopierInput struct {
 	Source    object
 	Dest      object
 	Delete    bool
@@ -57,6 +67,7 @@ type Input struct {
 	Region    *string
 }
 
+// Copier holds the configuration details for copying from an s3 object to another s3 location.
 type Copier struct {
 	// The chunk size for parts.
 	PartSize int64
@@ -84,6 +95,7 @@ func WithCopierRequestOptions(opts ...request.Option) func(*Copier) {
 // NewCopier creates a new Copier instance to copy opbjects concurrently from
 // one s3 location to another.
 func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
+
 	c := &Copier{
 		PartSize:    DefaultCopyPartSize,
 		S3:          s3.New(cfgp),
@@ -96,6 +108,7 @@ func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
 	return c
 }
 
+// NewCopierWithClient returns a Copier using the provided s3API client.
 func NewCopierWithClient(svc s3iface.S3API, options ...func(*Copier)) *Copier {
 	c := &Copier{
 		S3:          svc,
@@ -108,23 +121,25 @@ func NewCopierWithClient(svc s3iface.S3API, options ...func(*Copier)) *Copier {
 	return c
 }
 
+// maxRetrier provices an interface to MaRetries. This was copied from aws sdk.
+// TODO(ro) 2017-07-22 remove if part of the s3manager package.
 type maxRetrier interface {
 	MaxRetries() int
 }
 
-func (c Copier) Copy(i Input) error {
-	if *i.SrcRegion != "" {
+// Copy copies the source object to the tagret object.
+func (c Copier) Copy(i CopierInput) error {
+	if *i.SrcRegion != "" && i.Delete {
 		srcSess := session.Must(session.NewSession(
 			&aws.Config{Region: i.SrcRegion}))
 		c.SrcS3 = s3.New(srcSess)
-	} else {
-		c.SrcS3 = c.S3
 	}
 
 	return c.CopyWithContext(context.Background(), i)
 }
 
-func (c Copier) CopyWithContext(ctx aws.Context, input Input, options ...func(*Copier)) error {
+// CopyWithContext performs Copy with the provided context.Context.
+func (c Copier) CopyWithContext(ctx aws.Context, input CopierInput, options ...func(*Copier)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	impl := copier{in: input, cfg: c, ctx: ctx, cancel: cancel, wg: &sync.WaitGroup{}}
 
@@ -152,12 +167,12 @@ type copier struct {
 	cancel context.CancelFunc
 	cfg    Copier
 
-	in      Input
+	in      CopierInput
 	parts   []*s3.CompletedPart
 	results chan copyPartResult
 
 	wg *sync.WaitGroup
-	m  sync.Mutex
+	m  *sync.Mutex
 
 	err error
 
@@ -184,25 +199,8 @@ func (c copier) copy() error {
 	fmt.Printf("Got info %#v\n", *info)
 	// If smaller than part size, just copy.
 	if *info.ContentLength < c.cfg.PartSize {
-		coi := &s3.CopyObjectInput{
-			Bucket:     c.in.Dest.Bucket(),
-			Key:        c.in.Dest.Key(),
-			CopySource: c.in.Source.CopySourceString(),
-		}
-		_, err = c.cfg.S3.CopyObject(coi)
-		if err != nil {
-			if aerr, ok := err.(awserr.Error); ok {
-				fmt.Fprintf(
-					os.Stderr, "Failed to get source info for %s: %s\n",
-					c.in.Source, aerr.Error())
-			} else {
-				fmt.Fprintf(
-					os.Stderr, "Failed to get source info for %s: %s\n",
-					c.in.Source, err)
-			}
-			return err
-		}
-		return nil
+		return c.copyObject()
+
 	}
 
 	// Otherwise do a multipart copy.
@@ -216,7 +214,7 @@ func (c copier) copy() error {
 	c.parts = make([]*s3.CompletedPart, partCount)
 	c.results = make(chan copyPartResult, c.cfg.Concurrency)
 	var partNum int64
-	size := int64(*info.ContentLength)
+	size := *info.ContentLength
 	for size >= 0 {
 		for i := 0; i < c.cfg.Concurrency; i++ {
 			offset := c.cfg.PartSize * partNum
@@ -230,10 +228,8 @@ func (c copier) copy() error {
 				Key:             c.in.Dest.Key(),
 				CopySource:      c.in.Source.CopySourceString(),
 				CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", offset, endByte)),
-				UploadId:        uid,
+				UploadID:        uid,
 			}
-			// fmt.Printf("Starting copy for part %d\nrange: %s\n", partNum, *mci.CopySourceRange)
-			// fmt.Println("incrementing wg", partNum+1)
 			c.wg.Add(1)
 			go c.copyPart(mci)
 			partNum++
@@ -250,10 +246,31 @@ func (c copier) copy() error {
 	return c.complete(uid)
 }
 
+func (c copier) copyObject() error {
+	coi := &s3.CopyObjectInput{
+		Bucket:     c.in.Dest.Bucket(),
+		Key:        c.in.Dest.Key(),
+		CopySource: c.in.Source.CopySourceString(),
+	}
+	_, err := c.cfg.S3.CopyObject(coi)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			fmt.Fprintf(
+				os.Stderr, "Failed to get source info for %s: %s\n",
+				c.in.Source, aerr.Error())
+		} else {
+			fmt.Fprintf(
+				os.Stderr, "Failed to get source info for %s: %s\n",
+				c.in.Source, err)
+		}
+		return err
+	}
+	return nil
+
+}
 func (c copier) collect() {
 	fmt.Println("collecting")
 	for r := range c.results {
-		// fmt.Println("finished part ", r.Part)
 		c.parts[r.Part-1] = &s3.CompletedPart{
 			ETag:       r.CopyPartResult.ETag,
 			PartNumber: aws.Int64(r.Part)}
@@ -280,9 +297,9 @@ func (c copier) wait() {
 		c.cancel()
 		fmt.Fprintf(os.Stderr, "Caught signal %s\n", sig)
 		os.Exit(0)
-	case <-time.After(time.Duration(DefaultCopyTimeout)):
+	case <-time.After(DefaultCopyTimeout):
 		c.cancel()
-		fmt.Fprintf(os.Stderr, "Copy timed out in %s seconds\n", DefaultCopyTimeout)
+		fmt.Fprintf(os.Stderr, "Copy timed out in %d seconds\n", DefaultCopyTimeout)
 		os.Exit(1)
 	}
 }
@@ -303,16 +320,17 @@ func (c copier) setErr(e error) {
 
 func (c copier) copyPart(in multipartCopyInput) {
 	var err error
+	var resp *s3.UploadPartCopyOutput
 	upci := &s3.UploadPartCopyInput{
 		Bucket:          in.Bucket,
 		Key:             in.Key,
 		CopySource:      in.CopySource,
 		CopySourceRange: in.CopySourceRange,
 		PartNumber:      aws.Int64(in.Part),
-		UploadId:        in.UploadId,
+		UploadId:        in.UploadID,
 	}
 	for retry := 0; retry <= c.maxRetries; retry++ {
-		resp, err := c.cfg.S3.UploadPartCopy(upci)
+		resp, err = c.cfg.S3.UploadPartCopy(upci)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci)
 			continue
@@ -320,13 +338,11 @@ func (c copier) copyPart(in multipartCopyInput) {
 		c.results <- copyPartResult{
 			Part:           in.Part,
 			CopyPartResult: resp.CopyPartResult}
-		// fmt.Printf("copied part %d\n", in.Part)
 		break
 	}
 	if err != nil {
 		c.setErr(err)
 	}
-	// fmt.Println("decrementing wg", in.Part)
 	c.wg.Done()
 	return
 }
@@ -362,7 +378,7 @@ type multipartCopyInput struct {
 	CopySource      *string
 	CopySourceRange *string
 	Key             *string
-	UploadId        *string
+	UploadID        *string
 }
 
 func (c copier) startMulipart(o object) (*string, error) {
@@ -378,7 +394,7 @@ func (c copier) startMulipart(o object) (*string, error) {
 }
 
 func (c copier) objectInfo(o object) (*s3.HeadObjectOutput, error) {
-	info, err := c.cfg.SrcS3.HeadObject(&s3.HeadObjectInput{
+	info, err := c.cfg.S3.HeadObject(&s3.HeadObjectInput{
 		Bucket: c.in.Source.Bucket(),
 		Key:    c.in.Source.Key(),
 	})
@@ -427,7 +443,7 @@ func main() {
 	destElems := strings.SplitN(*dest, "/", 2)
 	dst := object{bucket: destElems[0], key: destElems[1]}
 
-	in := Input{Source: src, Dest: dst, Delete: *move, Region: region, SrcRegion: srcRegion}
+	in := CopierInput{Source: src, Dest: dst, Delete: *move, Region: region, SrcRegion: srcRegion}
 	sess := session.Must(session.NewSession(
 		&aws.Config{Region: in.Region}))
 
@@ -435,9 +451,6 @@ func main() {
 	err = copier.Copy(in)
 
 	if err != nil {
-		fmt.Fprintf(
-			os.Stderr, "Failed to get source info for %s: %s\n",
-			in.Source, err)
 		os.Exit(1)
 	}
 }
