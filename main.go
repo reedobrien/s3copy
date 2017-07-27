@@ -170,6 +170,7 @@ type copier struct {
 	in      CopierInput
 	parts   []*s3.CompletedPart
 	results chan copyPartResult
+	work    chan multipartCopyInput
 
 	wg *sync.WaitGroup
 	m  *sync.Mutex
@@ -213,10 +214,11 @@ func (c copier) copy() error {
 	partCount := int(math.Ceil(float64(*info.ContentLength) / float64(c.cfg.PartSize)))
 	c.parts = make([]*s3.CompletedPart, partCount)
 	c.results = make(chan copyPartResult, c.cfg.Concurrency)
+	c.work = make(chan multipartCopyInput, c.cfg.Concurrency)
 	var partNum int64
 	size := *info.ContentLength
-	for size >= 0 {
-		for i := 0; i < c.cfg.Concurrency; i++ {
+	go func() {
+		for size >= 0 {
 			offset := c.cfg.PartSize * partNum
 			endByte := offset + c.cfg.PartSize - 1
 			if endByte >= *info.ContentLength {
@@ -231,7 +233,7 @@ func (c copier) copy() error {
 				UploadID:        uid,
 			}
 			c.wg.Add(1)
-			go c.copyPart(mci)
+			c.work <- mci
 			partNum++
 			size -= c.cfg.PartSize
 			if size <= 0 {
@@ -239,6 +241,11 @@ func (c copier) copy() error {
 			}
 
 		}
+		close(c.work)
+	}()
+
+	for i := 0; i < c.cfg.Concurrency; i++ {
+		go c.copyParts()
 	}
 	go c.collect()
 	c.wait()
@@ -318,32 +325,34 @@ func (c copier) setErr(e error) {
 	c.err = e
 }
 
-func (c copier) copyPart(in multipartCopyInput) {
+func (c copier) copyParts() {
 	var err error
 	var resp *s3.UploadPartCopyOutput
-	upci := &s3.UploadPartCopyInput{
-		Bucket:          in.Bucket,
-		Key:             in.Key,
-		CopySource:      in.CopySource,
-		CopySourceRange: in.CopySourceRange,
-		PartNumber:      aws.Int64(in.Part),
-		UploadId:        in.UploadID,
-	}
-	for retry := 0; retry <= c.maxRetries; retry++ {
-		resp, err = c.cfg.S3.UploadPartCopy(upci)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci)
-			continue
+	for in := range c.work {
+		upci := &s3.UploadPartCopyInput{
+			Bucket:          in.Bucket,
+			Key:             in.Key,
+			CopySource:      in.CopySource,
+			CopySourceRange: in.CopySourceRange,
+			PartNumber:      aws.Int64(in.Part),
+			UploadId:        in.UploadID,
 		}
-		c.results <- copyPartResult{
-			Part:           in.Part,
-			CopyPartResult: resp.CopyPartResult}
-		break
+		for retry := 0; retry <= c.maxRetries; retry++ {
+			resp, err = c.cfg.S3.UploadPartCopy(upci)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci)
+				continue
+			}
+			c.results <- copyPartResult{
+				Part:           in.Part,
+				CopyPartResult: resp.CopyPartResult}
+			break
+		}
+		if err != nil {
+			c.setErr(err)
+		}
+		c.wg.Done()
 	}
-	if err != nil {
-		c.setErr(err)
-	}
-	c.wg.Done()
 	return
 }
 
