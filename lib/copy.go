@@ -51,6 +51,9 @@ type Copier struct {
 	// The chunk size for parts.
 	PartSize int64
 
+	// How long to run before we quit waiting.
+	Timeout time.Duration
+
 	// How many parts to copy at once.
 	Concurrency int
 
@@ -77,6 +80,7 @@ func NewCopier(cfgp client.ConfigProvider, options ...func(*Copier)) *Copier {
 
 	c := &Copier{
 		PartSize:    DefaultCopyPartSize,
+		Timeout:     DefaultCopyTimeout,
 		S3:          s3.New(cfgp),
 		Concurrency: DefaultCopyConcurrency,
 	}
@@ -283,9 +287,9 @@ func (c copier) wait() {
 		c.cancel()
 		log.Printf("Caught signal %s\n", sig)
 		os.Exit(0)
-	case <-time.After(DefaultCopyTimeout):
+	case <-time.After(c.cfg.Timeout):
 		c.cancel()
-		log.Printf("Copy timed out in %d seconds\n", DefaultCopyTimeout)
+		log.Printf("Copy timed out in %s seconds\n", c.cfg.Timeout)
 		os.Exit(1)
 	}
 }
