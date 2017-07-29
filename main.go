@@ -61,6 +61,9 @@ func main() {
 		&aws.Config{Region: in.Region}))
 
 	copier := s3copy.NewCopier(sess)
+	// copier := s3copy.NewCopier(sess, func(c *s3copy.Copier) {
+	// 	c.Timeout = 1 * time.Second
+	// })
 	err = copier.Copy(in)
 
 	if err != nil {
