@@ -112,10 +112,12 @@ type maxRetrier interface {
 
 // Copy copies the source object to the tagret object.
 func (c Copier) Copy(i CopierInput) error {
-	if *i.SrcRegion != "" && i.Delete {
+	if i.SrcRegion != nil && *i.SrcRegion != "" {
 		srcSess := session.Must(session.NewSession(
 			&aws.Config{Region: i.SrcRegion}))
 		c.SrcS3 = s3.New(srcSess)
+	} else {
+		c.SrcS3 = c.S3
 	}
 
 	return c.CopyWithContext(context.Background(), i)
@@ -386,18 +388,18 @@ func (c copier) startMulipart(o object) (*string, error) {
 }
 
 func (c copier) objectInfo(o object) (*s3.HeadObjectOutput, error) {
-	info, err := c.cfg.S3.HeadObject(&s3.HeadObjectInput{
+	info, err := c.cfg.SrcS3.HeadObject(&s3.HeadObjectInput{
 		Bucket: c.in.Source.Bucket(),
 		Key:    c.in.Source.Key(),
 	})
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			log.Printf(
-				"Failed to get source info for %s: %s\n",
+				"Failed to get source object info for %s: %s\n",
 				c.in.Source, aerr.Error())
 		} else {
 			log.Printf(
-				"Failed to get source info for %s: %s\n",
+				"Failed to get source object info for %s: %s\n",
 				c.in.Source, err)
 		}
 		return nil, err
