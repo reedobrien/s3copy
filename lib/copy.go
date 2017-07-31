@@ -35,6 +35,7 @@ type object interface {
 	Key() *string
 	CopySourceString() *string
 	String() string
+	Size() int
 }
 
 // CopierInput holds the input paramters for Copier.Copy.
@@ -165,8 +166,23 @@ type copier struct {
 	maxRetries int
 }
 
+func (c copier) getContentLength() (int64, error) {
+	var size int64
+	size = int64(c.in.Source.Size())
+	// If less than 1 we want to double check, because unset == 0. We can make
+	// it a pointer and check for nil later.
+	if size <= 0 {
+		info, err := c.objectInfo(c.in.Source)
+		if err != nil {
+			return -1, err
+		}
+		size = *info.ContentLength
+	}
+
+	return size, nil
+}
 func (c copier) copy() error {
-	info, err := c.objectInfo(c.in.Source)
+	contentLength, err := c.getContentLength()
 	if err != nil {
 		return err
 	}
@@ -184,7 +200,7 @@ func (c copier) copy() error {
 
 	// fmt.Printf("Got info %#v\n", *info)
 	// If smaller than part size, just copy.
-	if *info.ContentLength < c.cfg.PartSize {
+	if contentLength < c.cfg.PartSize {
 		return c.copyObject()
 
 	}
@@ -196,18 +212,18 @@ func (c copier) copy() error {
 	}
 	// fmt.Printf("Started MultipartUpload %s\n", *uid)
 
-	partCount := int(math.Ceil(float64(*info.ContentLength) / float64(c.cfg.PartSize)))
+	partCount := int(math.Ceil(float64(contentLength)) / float64(c.cfg.PartSize))
 	c.parts = make([]*s3.CompletedPart, partCount)
 	c.results = make(chan copyPartResult, c.cfg.Concurrency)
 	c.work = make(chan multipartCopyInput, c.cfg.Concurrency)
 	var partNum int64
-	size := *info.ContentLength
+	size := contentLength
 	go func() {
 		for size >= 0 {
 			offset := c.cfg.PartSize * partNum
 			endByte := offset + c.cfg.PartSize - 1
-			if endByte >= *info.ContentLength {
-				endByte = *info.ContentLength - 1
+			if endByte >= contentLength {
+				endByte = contentLength - 1
 			}
 			mci := multipartCopyInput{
 				Part:            partNum + 1,

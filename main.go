@@ -15,6 +15,7 @@ import (
 type object struct {
 	bucket string
 	key    string
+	size   int
 }
 
 // Bucket returns the string pointer value for the bucket.
@@ -25,6 +26,12 @@ func (o object) Bucket() *string {
 // Key returns the string pointer value for the object key.
 func (o object) Key() *string {
 	return aws.String(o.key)
+}
+
+// Size returns the content length of the object. Used only for source here.
+// This allows us to avoid a head call when we know the size from an S3 event.
+func (o object) Size() int {
+	return o.size
 }
 
 // CopySourceString returns the string pointer value for passing into various
