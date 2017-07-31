@@ -212,7 +212,7 @@ func (c copier) copy() error {
 	}
 	// fmt.Printf("Started MultipartUpload %s\n", *uid)
 
-	partCount := int(math.Ceil(float64(contentLength)) / float64(c.cfg.PartSize))
+	partCount := int(math.Ceil(float64(contentLength) / float64(c.cfg.PartSize)))
 	c.parts = make([]*s3.CompletedPart, partCount)
 	c.results = make(chan copyPartResult, c.cfg.Concurrency)
 	c.work = make(chan multipartCopyInput, c.cfg.Concurrency)
