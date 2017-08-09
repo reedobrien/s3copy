@@ -8,7 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	s3copy "gitlab.com/reedobrien/s3copy/lib"
+	s3copy "github.com/reedobrien/s3copy/lib"
 )
 
 // object details the location of a specific object.
