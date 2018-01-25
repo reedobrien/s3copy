@@ -21,7 +21,7 @@ import (
 )
 
 // DefaultCopyPartSize declares the default size of chunks to get copied. It is currently set dumbly to 500MB. So that the maximum object size (5TB) will work without exceeding the maximum part count (10,000).
-const DefaultCopyPartSize = 1024 * 1024 * 500
+const DefaultCopyPartSize = 1024 * 1024 * 100
 
 // DefaultCopyConcurrency sets the number of parts to request copying at once.
 const DefaultCopyConcurrency = 64
@@ -186,6 +186,7 @@ func (c copier) copy() error {
 	if err != nil {
 		return err
 	}
+	// log.Printf("ContentLength (%d) for %q", contentLength, c.in.Source.String())
 
 	// If there's a request to delete the source copy, do it on exit if there
 	// was no error copying.
@@ -198,9 +199,9 @@ func (c copier) copy() error {
 		}()
 	}
 
-	// fmt.Printf("Got info %#v\n", *info)
 	// If smaller than part size, just copy.
 	if contentLength < c.cfg.PartSize {
+		log.Printf("Single part copy: %q", c.in.Source.String())
 		return c.copyObject()
 
 	}
@@ -210,7 +211,7 @@ func (c copier) copy() error {
 	if err != nil {
 		return err
 	}
-	// fmt.Printf("Started MultipartUpload %s\n", *uid)
+	log.Printf("Started MultipartUpload %q for %q", *uid, c.in.Source.String())
 
 	partCount := int(math.Ceil(float64(contentLength) / float64(c.cfg.PartSize)))
 	c.parts = make([]*s3.CompletedPart, partCount)
@@ -242,9 +243,11 @@ func (c copier) copy() error {
 			}
 
 		}
+		// log.Printf("MultipartUpload copy parts assembled %d parts", len(c.parts))
 		close(c.work)
 	}()
 
+	// log.Println("Copying parts")
 	for i := 0; i < c.cfg.Concurrency; i++ {
 		go c.copyParts()
 	}
@@ -277,22 +280,34 @@ func (c copier) copyObject() error {
 
 }
 func (c copier) collect() {
-	// fmt.Println("collecting")
-	for r := range c.results {
-		c.parts[r.Part-1] = &s3.CompletedPart{
-			ETag:       r.CopyPartResult.ETag,
-			PartNumber: aws.Int64(r.Part)}
+	fmt.Println("collecting")
+	var received int
+	c.wg.Add(1)
+	defer c.wg.Done()
+	for {
+		select {
+		case r := <-c.results:
+			// log.Printf("collected %d: %s", r.Part, *c.in.Source.Key())
+			c.parts[r.Part-1] = &s3.CompletedPart{
+				ETag:       r.CopyPartResult.ETag,
+				PartNumber: aws.Int64(r.Part)}
+			received++
+		case <-time.After(time.Second):
+			if received == len(c.parts) {
+				close(c.results)
+				return
+			}
+		}
 	}
 }
 
 func (c copier) wait() {
+	fmt.Println("waiting")
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	done := make(chan struct{})
 	go func() {
-		// fmt.Println("waiting")
 		c.wg.Wait()
-		close(c.results)
 		done <- struct{}{}
 	}()
 
@@ -338,27 +353,33 @@ func (c copier) copyParts() {
 			PartNumber:      aws.Int64(in.Part),
 			UploadId:        in.UploadID,
 		}
+		log.Printf("Copy part: %d %#v", *upci.PartNumber, *upci.Key)
 		for retry := 0; retry <= c.maxRetries; retry++ {
 			resp, err = c.cfg.S3.UploadPartCopy(upci)
 			if err != nil {
 				log.Printf("Error: %s\n Part: %d\n Input %#v\n", err, in.Part, *upci)
 				continue
 			}
+			// log.Printf("sending copyPartResult for part %d: %s", in.Part, *in.Key)
 			c.results <- copyPartResult{
 				Part:           in.Part,
 				CopyPartResult: resp.CopyPartResult}
+			// log.Printf("copyParts done part %d for %s", in.Part, *in.Key)
+			c.wg.Done()
 			break
 		}
+		// c.wg.Done()
 		if err != nil {
+			log.Printf("setting error received retrying part upload %d for : %q", in.Part, *in.Key)
 			c.setErr(err)
 		}
-		c.wg.Done()
 	}
 	return
 }
 
 func (c copier) complete(uid *string) error {
-	// fmt.Println("finishing")
+	log.Printf("completing...%q without error? %s", *uid, c.err)
+
 	cmui := &s3.CompleteMultipartUploadInput{
 		Bucket:   c.in.Dest.Bucket(),
 		Key:      c.in.Dest.Key(),
@@ -370,8 +391,10 @@ func (c copier) complete(uid *string) error {
 	_, err := c.cfg.S3.CompleteMultipartUpload(cmui)
 	if err != nil {
 		log.Printf("Failed to complete copy for %s: %s\n", *c.in.Source.CopySourceString(), err)
+		log.Println(c.parts)
 		return err
 	}
+	log.Println("completed...", *uid)
 	return nil
 
 }
@@ -382,8 +405,7 @@ type copyPartResult struct {
 }
 
 type multipartCopyInput struct {
-	Part int64
-
+	Part            int64
 	Bucket          *string
 	CopySource      *string
 	CopySourceRange *string

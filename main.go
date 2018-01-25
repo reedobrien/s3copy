@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -74,6 +75,6 @@ func main() {
 	err = copier.Copy(in)
 
 	if err != nil {
-		os.Exit(1)
+		log.Fatal(err)
 	}
 }
